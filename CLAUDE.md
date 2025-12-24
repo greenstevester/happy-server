@@ -1,6 +1,8 @@
-# Handy Server - Development Guidelines
+# CLAUDE.md
 
-This document contains the development guidelines and instructions for the Happy Server project. This guide OVERRIDES any default behaviors and MUST be followed exactly.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+This guide OVERRIDES any default behaviors and MUST be followed exactly.
 
 ## Project Overview
 
@@ -27,12 +29,16 @@ This document contains the development guidelines and instructions for the Happy
 ## Development Environment
 
 ### Commands
-- `yarn build` - TypeScript type checking
-- `yarn start` - Start the server
-- `yarn test` - Run tests
-- `yarn migrate` - Run Prisma migrations
+- `yarn dev` - Start development server (kills existing process on port 3005, loads .env and .env.dev)
+- `yarn build` - TypeScript type checking only (tsc --noEmit)
+- `yarn start` - Start production server
+- `yarn test` - Run all tests
+- `yarn test sources/utils/lru.spec.ts` - Run a single test file
+- `yarn migrate` - Run Prisma migrations (uses .env.dev)
 - `yarn generate` - Generate Prisma client
 - `yarn db` - Start local PostgreSQL in Docker
+- `yarn redis` - Start local Redis in Docker
+- `yarn s3` - Start local MinIO (S3-compatible) in Docker
 
 ### Environment Requirements
 - FFmpeg installed (for media processing)
@@ -56,25 +62,34 @@ This document contains the development guidelines and instructions for the Happy
 
 ### Folder Structure
 ```
-/sources                    # Root of the sources
-├── /app                   # Application entry points
-│   ├── api.ts            # API server setup
-│   └── timeout.ts        # Timeout handling
-├── /apps                  # Applications directory
-│   └── /api              # API server application
-│       └── /routes       # API routes
-├── /modules              # Reusable modules (non-application logic)
-├── /utils                # Low level or abstract utilities
-├── /recipes              # Scripts to run outside of the server
-├── /services             # Core services
-│   └── pubsub.ts        # Pub/sub service
-├── /storage              # Database and storage utilities
-│   ├── db.ts            # Database client
-│   ├── inTx.ts          # Transaction wrapper
-│   ├── repeatKey.ts     # Key utilities
-│   ├── simpleCache.ts   # Caching utility
-│   └── types.ts         # Storage types
-└── main.ts               # Main entry point
+/sources
+├── main.ts               # Entry point - initializes storage, auth, starts API
+├── context.ts            # User context wrapper
+├── types.ts              # Shared TypeScript types (incl. Prisma JSON types)
+├── /app                  # Application-specific logic
+│   ├── /api              # Fastify API server
+│   │   ├── api.ts        # Server setup, route registration
+│   │   ├── socket.ts     # Socket.io setup
+│   │   ├── /routes       # REST endpoints (sessionRoutes.ts, authRoutes.ts, etc.)
+│   │   ├── /socket       # WebSocket handlers
+│   │   └── /utils        # Auth, monitoring, error handling
+│   ├── /auth             # Authentication module
+│   ├── /events           # eventRouter.ts - WebSocket event routing
+│   ├── /session          # Session operations (sessionDelete.ts)
+│   ├── /social           # Friend/relationship operations
+│   ├── /feed             # Feed operations
+│   ├── /kv               # Key-value store operations
+│   └── /presence         # Activity tracking, session cache
+├── /modules              # Reusable modules (non-app logic)
+│   ├── encrypt.ts        # Encryption helpers
+│   └── github.ts         # GitHub API integration
+├── /storage              # Database and storage layer
+│   ├── db.ts             # Prisma client
+│   ├── redis.ts          # Redis client
+│   ├── inTx.ts           # Transaction wrapper with afterTx callbacks
+│   ├── seq.ts            # Sequence number allocation
+│   └── files.ts          # S3/MinIO file storage
+└── /utils                # Low-level utilities
 ```
 
 ### Naming Conventions
@@ -137,16 +152,39 @@ This document contains the development guidelines and instructions for the Happy
 - For complex fields, use "Json" type
 - NEVER DO MIGRATION YOURSELF. Only run yarn generate when new types needed
 
-### Current Schema Status
-The project has pending Prisma migrations that need to be applied:
-- Migration: `20250715012822_add_metadata_version_agent_state`
+### Typed JSON Fields
+Use `/// [TypeName]` comments in schema.prisma to enable typed JSON fields:
+```prisma
+/// [SessionMessageContent]
+content   Json
+```
+Types are defined in `@/types.ts` and generated via `prisma-json-types-generator`.
 
 ## Events
 
-### Event Bus
-- eventbus allows sending and receiving events inside the process and between different processes
-- eventbus is local or redis based
-- Use "afterTx" to send events after transaction is committed successfully instead of directly emitting events
+### Event Architecture
+The server uses an EventRouter (`@/app/events/eventRouter`) for real-time updates:
+
+**Event Types:**
+- `UpdateEvent` - Persistent updates with sequence numbers (new-session, new-message, update-session, etc.)
+- `EphemeralEvent` - Transient status (activity, machine-status, usage) - not persisted
+
+**Connection Scopes:**
+- `user-scoped` - Mobile/web apps that need all user data
+- `session-scoped` - CLI connections bound to a specific session
+- `machine-scoped` - Daemon connections bound to a specific machine
+
+**Recipient Filters:**
+- `all-interested-in-session` - Session-scoped (matching) + user-scoped
+- `user-scoped-only` - Only mobile/web apps
+- `machine-scoped-only` - User-scoped + specific machine
+- `all-user-authenticated-connections` - Everyone
+
+**Sending Updates:**
+- Use `afterTx()` to emit events after transaction commits successfully
+- Use `eventRouter.emitUpdate()` for persistent updates
+- Use `eventRouter.emitEphemeral()` for transient status
+- Updates include sequence numbers via `allocateUserSeq()` for client ordering
 
 ## Testing
 
@@ -156,11 +194,29 @@ The project has pending Prisma migrations that need to be applied:
 
 ## API Development
 
-- API server is in `/sources/apps/api`
-- Routes are in `/sources/apps/api/routes`
-- Use Fastify with Zod for type-safe route definitions
-- Always validate inputs using Zod
-- **Idempotency**: Design all operations to be idempotent - clients may retry requests automatically and the backend must handle multiple invocations of the same operation gracefully, producing the same result as a single invocation
+- API server entry: `/sources/app/api/api.ts`
+- Routes: `/sources/app/api/routes/`
+- Socket handlers: `/sources/app/api/socket/`
+
+### Route Pattern
+```typescript
+app.post('/v1/endpoint', {
+    schema: {
+        body: z.object({ ... }),
+        params: z.object({ ... })
+    },
+    preHandler: app.authenticate  // Adds request.userId
+}, async (request, reply) => {
+    const userId = request.userId;
+    // ...
+});
+```
+
+### Key Principles
+- Always validate inputs using Zod schemas
+- **Idempotency**: All operations must be idempotent - clients retry automatically
+- Use `preHandler: app.authenticate` for authenticated routes
+- Server runs on port 3005 (configurable via PORT env var)
 
 ## Docker Deployment
 
